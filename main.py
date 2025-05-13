@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 from io import BytesIO
 
-BOT_TOKEN = "8153748905:AAGp03pGvNcuL7CAhcOV92jGv2c9opX-BVU"
+BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuD"
 
 logging.basicConfig(level=logging.INFO)
 user_data = {}
@@ -42,13 +42,19 @@ def detect_stripe_type(html):
 def try_login(site, email, password):
     session = requests.Session()
     login_url = f"https://{site}/my-account/"
+    logging.info(f"Attempting to login to {site} with email: {email}")
     r = session.get(login_url, headers=get_headers())
+    
+    if r.status_code != 200:
+        logging.error(f"Failed to load login page, status code: {r.status_code}")
+        return None, "Login page error"
+    
     soup = BeautifulSoup(r.text, 'html.parser')
     nonce = soup.find("input", {"name": "woocommerce-login-nonce"})
     referer = soup.find("input", {"name": "_wp_http_referer"})
 
     if not nonce:
-        return None, "Login page error"
+        return None, "Nonce not found in the login page"
 
     payload = {
         'username': email,
@@ -58,10 +64,14 @@ def try_login(site, email, password):
         'login': 'Log in'
     }
 
+    logging.info(f"Posting login data to {login_url}")
     r = session.post(login_url, data=payload, headers=get_headers())
     if "customer-logout" in r.text:
+        logging.info("Login successful!")
         return session, r.text
-    return None, "Login failed"
+    else:
+        logging.error(f"Login failed: {r.text}")
+        return None, "Login failed"
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -71,6 +81,8 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     site, email, password = args[0].split("|")
+    logging.info(f"Received /addsitelogin command from user {user_id} for site {site}")
+    
     session, resp_html = try_login(site, email, password)
     if not session:
         await update.message.reply_text(f"Login failed: {resp_html}")
@@ -83,6 +95,7 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "session": session,
     }
 
+    logging.info(f"User {user_id} logged in successfully to {site}. Asking for the payment URL.")
     await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,6 +119,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data[user_id]["pk"] = pk_live
     user_data[user_id]["stripe_type"] = stripe_type
 
+    logging.info(f"Stripe key detected: {pk_live}, Type: {stripe_type}")
     await update.message.reply_text(f"Stripe key: `{pk_live}`\nType: `{stripe_type}`", parse_mode="Markdown")
 
 def parse_card(card):
