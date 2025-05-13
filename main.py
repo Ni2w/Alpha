@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 from io import BytesIO
 
-BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuD"
+BOT_TOKEN = "8153748905:AAGp03pGvNcuL7CAhcOV92jGv2c9opX-BVU"
 
 logging.basicConfig(level=logging.INFO)
 user_data = {}
