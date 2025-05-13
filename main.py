@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from io import BytesIO
 
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs"
 
 logging.basicConfig(level=logging.INFO)
 user_data = {}
