@@ -1,25 +1,32 @@
 import logging
 import requests
 import re
-import time
-import threading
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 from io import BytesIO
 
 BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs"
 
 logging.basicConfig(level=logging.INFO)
 user_data = {}
-lock = threading.Lock()
 
 def get_headers():
     return {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "accept": "text/html,application/xhtml+xml",
-        "accept-language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9"
     }
+
+def extract_pk(html):
+    match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
+    return match.group(0) if match else None
 
 def detect_stripe_type(html):
     if "setup_intent" in html:
@@ -32,11 +39,8 @@ def detect_stripe_type(html):
         return "token"
     return "unknown"
 
-def extract_pk(html):
-    match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
-    return match.group(0) if match else None
-
-def try_login(site, email, password, session):
+def try_login(site, email, password):
+    session = requests.Session()
     login_url = f"https://{site}/my-account/"
     r = session.get(login_url, headers=get_headers())
     soup = BeautifulSoup(r.text, 'html.parser')
@@ -44,7 +48,7 @@ def try_login(site, email, password, session):
     referer = soup.find("input", {"name": "_wp_http_referer"})
 
     if not nonce:
-        return False, "Login page error."
+        return None, "Login page error"
 
     payload = {
         'username': email,
@@ -55,7 +59,9 @@ def try_login(site, email, password, session):
     }
 
     r = session.post(login_url, data=payload, headers=get_headers())
-    return ("customer-logout" in r.text), r.text
+    if "customer-logout" in r.text:
+        return session, r.text
+    return None, "Login failed"
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -65,20 +71,17 @@ async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     site, email, password = args[0].split("|")
-    session = requests.Session()
-
-    success, resp_html = try_login(site, email, password, session)
-    if not success:
-        await update.message.reply_text("Login failed.")
+    session, resp_html = try_login(site, email, password)
+    if not session:
+        await update.message.reply_text(f"Login failed: {resp_html}")
         return
 
-    with lock:
-        user_data[user_id] = {
-            "site": site,
-            "email": email,
-            "password": password,
-            "session": session,
-        }
+    user_data[user_id] = {
+        "site": site,
+        "email": email,
+        "password": password,
+        "session": session,
+    }
 
     await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
 
