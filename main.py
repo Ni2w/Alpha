@@ -4,7 +4,7 @@ import threading
 import logging
 import json
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import Update, Document
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from io import BytesIO
 
@@ -171,8 +171,13 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please login and send Add Payment URL first.")
         return
 
-    file = await update.message.document.get_file()
-    content = await file.download_as_bytes()
+    file = update.message.document
+    if not file.file_name.endswith(".txt"):
+        await update.message.reply_text("Please upload a .txt file.")
+        return
+
+    file_data = await file.get_file()
+    content = await file_data.download_as_bytes()
     combos = content.decode().splitlines()
 
     stats = {"total": 0, "approved": 0, "declined": 0, "errors": 0}
@@ -211,5 +216,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
     app.add_handler(CommandHandler("chk", chk))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(MessageHandler(filters.Document.MIME_TYPE("text/plain"), handle_txt))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_txt))  # Accept all documents and check extension manually
     app.run_polling()
