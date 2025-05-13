@@ -5,14 +5,19 @@ import logging
 import json
 from bs4 import BeautifulSoup
 from io import BytesIO
-from telegram import Update, Document
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters
 )
 
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
 BOT_TOKEN = "7248159727:AAEzc2CNStU6H8F3zD4Y5CFIYRSkyhO_TiQ"
-logging.basicConfig(level=logging.INFO)
 user_data = {}
 lock = threading.Lock()
 
@@ -90,14 +95,18 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     url = update.message.text
     session = user_data[user_id]["session"]
-    r = session.get(url, headers=get_headers())
-    html = r.text
-    pk = extract_pk(html)
-    api_type = detect_stripe_type(html)
-    user_data[user_id]["check_url"] = url
-    user_data[user_id]["pk"] = pk
-    user_data[user_id]["api_type"] = api_type
-    await update.message.reply_text(f"Detected API: `{api_type}`\nExtracted PK: `{pk}`", parse_mode="Markdown")
+    try:
+        r = session.get(url, headers=get_headers())
+        html = r.text
+        pk = extract_pk(html)
+        api_type = detect_stripe_type(html)
+        user_data[user_id]["check_url"] = url
+        user_data[user_id]["pk"] = pk
+        user_data[user_id]["api_type"] = api_type
+        await update.message.reply_text(f"Detected API: `{api_type}`\nExtracted PK: `{pk}`", parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Error fetching URL: {e}")
+        await update.message.reply_text("Failed to fetch and parse the Add Payment Method page.")
 
 
 def parse_card(card):
@@ -134,7 +143,7 @@ def submit_to_stripe(api_type, pk, cc, mm, yy, cvv):
     return r.json()
 
 
-async def /chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_data or "pk" not in user_data[user_id]:
         await update.message.reply_text("Please login and send Add Payment URL first.")
@@ -178,7 +187,7 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
-    app.add_handler(CommandHandler("chk", /chk))
+    app.add_handler(CommandHandler("chk", chk_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_url))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_txt))
     app.run_polling()
